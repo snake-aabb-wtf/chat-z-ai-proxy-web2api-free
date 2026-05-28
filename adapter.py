@@ -62,8 +62,10 @@ class ChatAdapter:
         self._chat_id = cid
         return cid
 
-    def _parse_sse_body(self, body: str) -> str:
-        parts = []
+    def _parse_sse_body(self, body: str) -> tuple:
+        """Parse SSE body into (thinking_text, answer_text)."""
+        thinking = []
+        answer = []
         for line in body.split("\n"):
             line = line.strip()
             if not line.startswith("data: "):
@@ -78,9 +80,14 @@ class ChatAdapter:
             inner = data.get("data")
             if isinstance(inner, dict):
                 content = inner.get("delta_content") or inner.get("content") or ""
-                if content:
-                    parts.append(content)
-        return "".join(parts)
+                if not content:
+                    continue
+                phase = inner.get("phase", "answering")
+                if phase == "thinking":
+                    thinking.append(content)
+                else:
+                    answer.append(content)
+        return "".join(thinking), "".join(answer)
 
     def convert_request(self, messages, stream=False, tools=None, tool_choice=None, **kwargs):
         if tools:
@@ -103,16 +110,18 @@ class ChatAdapter:
         result.insert(0, {"role": "system", "content": prompt})
         return result
 
-    def _build_response(self, content: str):
+    def _build_response(self, thinking: str, answer: str):
         ts = int(time.time())
+        message = {"role": "assistant", "content": answer}
+        if thinking:
+            message["reasoning_content"] = thinking
         return {"id": f"chatcmpl-{ts}", "object": "chat.completion", "created": ts,
                 "model": "gpt-4o",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
-                             "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
     def convert_with_dsml(self, full_text: str) -> dict:
-        base = self._build_response("")
+        base = self._build_response("", "")
         if not has_dsml_content(full_text):
             base["choices"][0]["message"]["content"] = full_text
             return base
@@ -143,7 +152,7 @@ class ChatAdapter:
         # Find input, type, send via Enter
         input_el = await self._page.query_selector("#chat-input, textarea, [contenteditable='true']")
         if not input_el:
-            return self._build_response("Error: Chat input not found")
+            return self._build_response("", "Error: Chat input not found")
 
         # Set up response capture
         api_result = {}
@@ -169,12 +178,13 @@ class ChatAdapter:
         self._page.remove_listener("response", on_chat_response)
 
         if not api_result.get("body"):
-            return self._build_response("Error: No response received from chat.z.ai")
+            return self._build_response("", "Error: No response received from chat.z.ai")
 
-        content = self._parse_sse_body(api_result["body"])
+        thinking, answer = self._parse_sse_body(api_result["body"])
+        content = answer or thinking  # fallback if no phase separation
         if self.dsml_enabled and self.dsml_ready and has_dsml_content(content):
             return self.convert_with_dsml(content)
-        return self._build_response(content)
+        return self._build_response(thinking, answer)
 
     async def stream_request(self, payload: dict) -> AsyncGenerator[bytes, None]:
         messages = payload["messages"]
@@ -235,7 +245,13 @@ class ChatAdapter:
             if isinstance(inner, dict):
                 content = inner.get("delta_content") or inner.get("content")
                 if content:
-                    chunk = {"choices": [{"delta": {"content": content}, "index": 0}]}
+                    phase = inner.get("phase", "answering")
+                    delta = {}
+                    if phase == "thinking":
+                        delta["reasoning_content"] = content
+                    else:
+                        delta["content"] = content
+                    chunk = {"choices": [{"delta": delta, "index": 0}]}
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
 
         yield b"data: [DONE]\n\n"
