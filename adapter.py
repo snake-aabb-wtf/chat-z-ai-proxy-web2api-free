@@ -142,17 +142,29 @@ class ChatAdapter:
             texts = [p.get("text", "") for p in last_msg if p.get("type") == "text"]
             last_msg = " ".join(texts)
 
-        if not self._chat_id:
-            await self._create_chat()
+        # Create fresh chat each time
+        await self._create_chat()
 
         # Navigate to chat page
-        await self._page.goto(f"{self.base_url}/c/{self._chat_id}", wait_until="networkidle")
-        await asyncio.sleep(5)
+        await self._page.goto(f"{self.base_url}/c/{self._chat_id}", wait_until="domcontentloaded")
+        await asyncio.sleep(8)
 
-        # Find input, type, send via Enter
-        input_el = await self._page.query_selector("#chat-input, textarea, [contenteditable='true']")
+        # If redirected back to main page, the chat_id is invalid - try once more
+        if not self._page.url.startswith(f"{self.base_url}/c/"):
+            await self._create_chat()
+            await self._page.goto(f"{self.base_url}/c/{self._chat_id}", wait_until="domcontentloaded")
+            await asyncio.sleep(8)
+
+        # Find input (poll DOM, not visibility)
+        input_el = None
+        for _ in range(30):
+            input_el = await self._page.query_selector("#chat-input, textarea, [contenteditable='true']")
+            if input_el:
+                break
+            await asyncio.sleep(1)
         if not input_el:
-            return self._build_response("", "Error: Chat input not found")
+            url_now = self._page.url
+            return self._build_response("", f"Error: Chat input not found (url={url_now})")
 
         # Set up response capture
         api_result = {}
